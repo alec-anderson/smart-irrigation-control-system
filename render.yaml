@@ -2,6 +2,7 @@ services:
   - type: web
     name: irrigation-monitor-api
     runtime: python
+    plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: python run_dev.py
@@ -17,8 +18,9 @@ services:
       - key: CORS_ORIGINS
         value: "*"
 
-  - type: static
+  - type: web
     name: irrigation-monitor-dashboard
+    runtime: static
     rootDir: dashboard
     buildCommand: python build_static.py
     staticPublishPath: dist
@@ -34,5 +36,6 @@ services:
 
 databases:
   - name: irrigation-monitor-db
+    plan: free
     databaseName: irrigation
     user: irrigation
