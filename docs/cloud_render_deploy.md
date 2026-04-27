@@ -63,6 +63,16 @@ DASHBOARD_API_BASE=https://irrigation-monitor-api.onrender.com
 
 Redeploy the dashboard after setting it.
 
+If the deployed dashboard shows `API error`, open:
+
+```text
+https://irrigation-monitor-dashboard.onrender.com/config.js
+```
+
+The generated config must contain the Render API URL. If it shows
+`http://localhost:8000`, `DASHBOARD_API_BASE` was not available to the dashboard
+build. Set it on the `irrigation-monitor-dashboard` service, then redeploy.
+
 For tighter CORS later, change API `CORS_ORIGINS` from `*` to the dashboard URL:
 
 ```text
