@@ -28,12 +28,22 @@ def _parse_device_tokens(raw: str) -> dict[str, str]:
     return tokens
 
 
+def _get_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str
     device_tokens: dict[str, str]
     dashboard_token: str
     cors_origins: list[str]
+    telemetry_retention_days: int
+    event_retention_days: int
+    retention_cleanup_interval_seconds: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -51,6 +61,11 @@ class Settings:
                 ).split(",")
                 if origin.strip()
             ],
+            telemetry_retention_days=_get_int("TELEMETRY_RETENTION_DAYS", 14),
+            event_retention_days=_get_int("EVENT_RETENTION_DAYS", 30),
+            retention_cleanup_interval_seconds=_get_int(
+                "RETENTION_CLEANUP_INTERVAL_SECONDS", 3600
+            ),
         )
 
 

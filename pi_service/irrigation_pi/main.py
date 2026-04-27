@@ -4,6 +4,7 @@ import argparse
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .collectors import (
@@ -17,6 +18,23 @@ from .collectors import (
 from .config import Settings
 from .db import LocalStore
 from .sync import CloudSyncClient
+
+
+@dataclass
+class AlertState:
+    zero_flow_started_at: float | None = None
+    last_zero_flow_alert_at: float = 0.0
+    last_vibration_alert_at: float = 0.0
+    last_backlog_alert_at: float = 0.0
+
+
+@dataclass
+class UploadState:
+    last_cloud_telemetry_at: float = 0.0
+    last_drive_mode: str | None = None
+    last_pump_on: bool | None = None
+    last_limit_min_active: bool | None = None
+    last_limit_max_active: bool | None = None
 
 
 def choose_collector(settings: Settings, force_demo: bool) -> TelemetryCollector:
@@ -39,36 +57,64 @@ def maybe_create_local_alerts(
     store: LocalStore,
     settings: Settings,
     telemetry: dict,
-    last_backlog_alert_at: float,
-) -> float:
+    state: AlertState,
+) -> None:
     """Create monitoring-only alerts. These do not alter local control state."""
     now = time.monotonic()
 
     pump_on = bool(telemetry.get("pump_on"))
     flow_rate = float(telemetry.get("flow_rate_l_min") or 0.0)
-    if pump_on and flow_rate < 0.1:
-        store.insert_event(
-            settings.device_id,
-            severity="warning",
-            event_type="zero_flow_while_irrigating",
-            message="Pump is reported on but measured flow is near zero.",
-            payload={"flow_rate_l_min": flow_rate},
-        )
+    zero_flow_active = (
+        settings.zero_flow_alert_enabled
+        and pump_on
+        and flow_rate < settings.zero_flow_threshold_l_min
+    )
+    if zero_flow_active:
+        if state.zero_flow_started_at is None:
+            state.zero_flow_started_at = now
+        zero_flow_duration = now - state.zero_flow_started_at
+        cooldown_elapsed = now - state.last_zero_flow_alert_at
+        if (
+            zero_flow_duration >= settings.zero_flow_min_seconds
+            and cooldown_elapsed >= settings.zero_flow_cooldown_seconds
+        ):
+            store.insert_event(
+                settings.device_id,
+                severity="warning",
+                event_type="zero_flow_while_irrigating",
+                message="Pump is reported on but measured flow is near zero.",
+                payload={
+                    "flow_rate_l_min": flow_rate,
+                    "duration_seconds": round(zero_flow_duration, 1),
+                    "threshold_l_min": settings.zero_flow_threshold_l_min,
+                },
+            )
+            state.last_zero_flow_alert_at = now
+    else:
+        state.zero_flow_started_at = None
 
     vibration = telemetry.get("vibration_rms_g")
-    if vibration is not None and float(vibration) > 0.5:
+    if (
+        vibration is not None
+        and float(vibration) > settings.vibration_alert_threshold_g
+        and now - state.last_vibration_alert_at >= settings.vibration_alert_cooldown_seconds
+    ):
         store.insert_event(
             settings.device_id,
             severity="warning",
             event_type="excessive_vibration",
             message="Vibration RMS exceeded prototype threshold.",
-            payload={"vibration_rms_g": vibration},
+            payload={
+                "vibration_rms_g": vibration,
+                "threshold_g": settings.vibration_alert_threshold_g,
+            },
         )
+        state.last_vibration_alert_at = now
 
     backlog = store.backlog_count()
     if (
         backlog > settings.queue_backlog_alert_threshold
-        and now - last_backlog_alert_at > 300
+        and now - state.last_backlog_alert_at > 300
     ):
         store.insert_event(
             settings.device_id,
@@ -77,9 +123,44 @@ def maybe_create_local_alerts(
             message="Cloud upload queue is growing while local logging continues.",
             payload={"backlog_count": backlog},
         )
-        return now
+        state.last_backlog_alert_at = now
 
-    return last_backlog_alert_at
+
+def should_upload_telemetry(
+    settings: Settings,
+    telemetry: dict,
+    state: UploadState,
+) -> bool:
+    """Upload lower-rate cloud telemetry while keeping all samples local."""
+    now = time.monotonic()
+    pump_on = bool(telemetry.get("pump_on"))
+    limit_min_active = bool(telemetry.get("limit_min_active"))
+    limit_max_active = bool(telemetry.get("limit_max_active"))
+    drive_mode = telemetry.get("drive_mode")
+
+    state_changed = (
+        state.last_pump_on is not None
+        and (
+            pump_on != state.last_pump_on
+            or limit_min_active != state.last_limit_min_active
+            or limit_max_active != state.last_limit_max_active
+            or drive_mode != state.last_drive_mode
+        )
+    )
+    interval_elapsed = (
+        now - state.last_cloud_telemetry_at
+        >= settings.cloud_telemetry_min_interval_seconds
+    )
+
+    state.last_pump_on = pump_on
+    state.last_limit_min_active = limit_min_active
+    state.last_limit_max_active = limit_max_active
+    state.last_drive_mode = drive_mode
+
+    if state.last_cloud_telemetry_at == 0.0 or state_changed or interval_elapsed:
+        state.last_cloud_telemetry_at = now
+        return True
+    return False
 
 
 def run(args: argparse.Namespace) -> int:
@@ -104,7 +185,8 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
 
     last_sync_at = 0.0
-    last_backlog_alert_at = 0.0
+    alert_state = AlertState()
+    upload_state = UploadState()
 
     print(f"Logging to {Path(settings.sqlite_path).resolve()}")
     print(f"Uploading to {settings.cloud_api_url} as {settings.device_id}")
@@ -112,9 +194,10 @@ def run(args: argparse.Namespace) -> int:
     try:
         while not stop_requested:
             telemetry = collector.read_telemetry()
-            store.insert_telemetry(settings.device_id, telemetry)
-            last_backlog_alert_at = maybe_create_local_alerts(
-                store, settings, telemetry, last_backlog_alert_at
+            upload_telemetry = should_upload_telemetry(settings, telemetry, upload_state)
+            store.insert_telemetry(settings.device_id, telemetry, enqueue=upload_telemetry)
+            maybe_create_local_alerts(
+                store, settings, telemetry, alert_state
             )
             store.upsert_device_status(
                 settings.device_id,

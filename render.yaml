@@ -17,6 +17,12 @@ services:
         sync: false
       - key: CORS_ORIGINS
         value: "*"
+      - key: TELEMETRY_RETENTION_DAYS
+        value: "14"
+      - key: EVENT_RETENTION_DAYS
+        value: "30"
+      - key: RETENTION_CLEANUP_INTERVAL_SECONDS
+        value: "3600"
 
   - type: web
     name: irrigation-monitor-dashboard

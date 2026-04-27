@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
 from .auth import require_dashboard_auth, require_device_auth
@@ -15,6 +15,7 @@ from .models import DeviceStatus, Event, IrrigationRun, Telemetry
 from .schemas import IngestBatch, IngestResponse, IngestRecord
 
 app = FastAPI(title="Irrigation Monitoring API", version="0.1.0")
+last_retention_cleanup_at: datetime | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,6 +128,29 @@ def run_to_dict(row: IrrigationRun) -> dict[str, Any]:
         "total_flow_l": row.total_flow_l,
         "summary": row.summary or {},
     }
+
+
+def maybe_run_retention_cleanup(db: Session) -> None:
+    """Keep the free test database bounded without affecting Pi local logs."""
+    global last_retention_cleanup_at
+
+    now = now_utc()
+    if (
+        last_retention_cleanup_at is not None
+        and now - last_retention_cleanup_at
+        < timedelta(seconds=settings.retention_cleanup_interval_seconds)
+    ):
+        return
+
+    if settings.telemetry_retention_days > 0:
+        telemetry_cutoff = now - timedelta(days=settings.telemetry_retention_days)
+        db.execute(delete(Telemetry).where(Telemetry.recorded_at < telemetry_cutoff))
+
+    if settings.event_retention_days > 0:
+        event_cutoff = now - timedelta(days=settings.event_retention_days)
+        db.execute(delete(Event).where(Event.recorded_at < event_cutoff))
+
+    last_retention_cleanup_at = now
 
 
 def upsert_status_from_record(
@@ -283,6 +307,7 @@ def ingest_batch(
         if record.client_queue_id is not None:
             accepted_queue_ids.append(record.client_queue_id)
 
+    maybe_run_retention_cleanup(db)
     db.commit()
     return IngestResponse(
         accepted=len(batch.records),

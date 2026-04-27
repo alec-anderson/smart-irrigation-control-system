@@ -56,7 +56,12 @@ class LocalStore:
             self._conn.rollback()
             raise
 
-    def insert_telemetry(self, device_id: str, payload: dict[str, Any]) -> str:
+    def insert_telemetry(
+        self,
+        device_id: str,
+        payload: dict[str, Any],
+        enqueue: bool = True,
+    ) -> str:
         record = dict(payload)
         record.setdefault("id", str(uuid.uuid4()))
         record.setdefault("device_id", device_id)
@@ -100,7 +105,8 @@ class LocalStore:
                     now,
                 ),
             )
-            self._enqueue(conn, "telemetry", record["id"], record)
+            if enqueue:
+                self._enqueue(conn, "telemetry", record["id"], record)
         return record["id"]
 
     def insert_event(

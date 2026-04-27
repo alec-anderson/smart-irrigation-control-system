@@ -33,6 +33,13 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     device_id: str
@@ -44,6 +51,13 @@ class Settings:
     sync_batch_size: int
     sync_timeout_seconds: float
     queue_backlog_alert_threshold: int
+    cloud_telemetry_min_interval_seconds: float
+    zero_flow_alert_enabled: bool
+    zero_flow_threshold_l_min: float
+    zero_flow_min_seconds: float
+    zero_flow_cooldown_seconds: float
+    vibration_alert_threshold_g: float
+    vibration_alert_cooldown_seconds: float
     telemetry_source: str
     telemetry_file: Path
     control_csv_glob: str
@@ -64,6 +78,17 @@ class Settings:
             sync_batch_size=_get_int("SYNC_BATCH_SIZE", 100),
             sync_timeout_seconds=_get_float("SYNC_TIMEOUT_SECONDS", 5.0),
             queue_backlog_alert_threshold=_get_int("QUEUE_BACKLOG_ALERT_THRESHOLD", 1000),
+            cloud_telemetry_min_interval_seconds=_get_float(
+                "CLOUD_TELEMETRY_MIN_INTERVAL_SECONDS", 10.0
+            ),
+            zero_flow_alert_enabled=_get_bool("ZERO_FLOW_ALERT_ENABLED", True),
+            zero_flow_threshold_l_min=_get_float("ZERO_FLOW_THRESHOLD_L_MIN", 0.1),
+            zero_flow_min_seconds=_get_float("ZERO_FLOW_MIN_SECONDS", 15.0),
+            zero_flow_cooldown_seconds=_get_float("ZERO_FLOW_COOLDOWN_SECONDS", 300.0),
+            vibration_alert_threshold_g=_get_float("VIBRATION_ALERT_THRESHOLD_G", 0.5),
+            vibration_alert_cooldown_seconds=_get_float(
+                "VIBRATION_ALERT_COOLDOWN_SECONDS", 300.0
+            ),
             telemetry_source=os.getenv("TELEMETRY_SOURCE", "demo").strip().lower(),
             telemetry_file=Path(os.getenv("TELEMETRY_FILE", "/var/lib/irrigation/latest_telemetry.json")),
             control_csv_glob=os.getenv(
