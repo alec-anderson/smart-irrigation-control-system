@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: irrigation
+      POSTGRES_USER: irrigation
+      POSTGRES_PASSWORD: irrigation_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://irrigation:irrigation_dev_password@postgres:5432/irrigation
+      DEVICE_TOKENS: pi-prototype-001:dev-device-token-change-me
+      DASHBOARD_TOKEN: dev-dashboard-token-change-me
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:

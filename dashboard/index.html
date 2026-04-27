@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Irrigation Monitor</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Irrigation Monitor</h1>
+        <p id="deviceLine">pi-prototype-001</p>
+      </div>
+      <div class="status-pill" id="connectionPill">Loading</div>
+    </header>
+
+    <main>
+      <section class="metric-grid" aria-label="Current system telemetry">
+        <article class="metric">
+          <span class="label">Soil moisture</span>
+          <strong id="soilValue">--</strong>
+        </article>
+        <article class="metric">
+          <span class="label">Flow rate</span>
+          <strong id="flowValue">--</strong>
+          <small id="totalFlowValue">-- total</small>
+        </article>
+        <article class="metric">
+          <span class="label">Angle</span>
+          <strong id="angleValue">--</strong>
+          <small id="alignmentValue">-- alignment</small>
+        </article>
+        <article class="metric">
+          <span class="label">Pump</span>
+          <strong id="pumpValue">--</strong>
+        </article>
+        <article class="metric">
+          <span class="label">Valve estimate</span>
+          <strong id="valveValue">--</strong>
+        </article>
+        <article class="metric">
+          <span class="label">Mode</span>
+          <strong id="modeValue">--</strong>
+        </article>
+        <article class="metric">
+          <span class="label">Limit switches</span>
+          <strong id="limitValue">--</strong>
+        </article>
+        <article class="metric">
+          <span class="label">Last seen</span>
+          <strong id="lastSeenValue">--</strong>
+          <small id="backlogValue">-- queued</small>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>History</h2>
+          <select id="historyWindow">
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24" selected>24 hours</option>
+          </select>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="soilFlowChart"></canvas>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="motionChart"></canvas>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Recent Alerts</h2>
+        </div>
+        <ol class="event-list" id="eventList"></ol>
+      </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

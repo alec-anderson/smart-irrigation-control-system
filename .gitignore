@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+pi_service/data/
+backend/*.sqlite3
+backend/vendor/
+backend/*.log
+dashboard/config.js
+dashboard/dist/
+
+.env
