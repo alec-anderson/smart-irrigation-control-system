@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+"""
+Nano-owned irrigation production console
+
+This version keeps the old Pi-side sensor/OLED/keypad features, but the
+travel/alignment motor logic now runs locally on the Nano. The Pi only sends
+high-level commands and logs telemetry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import math
+import os
+import queue
+import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+try:
+    import serial  # type: ignore
+    SERIAL_AVAILABLE = True
+except Exception:
+    serial = None
+    SERIAL_AVAILABLE = False
+
+try:
+    import spidev  # type: ignore
+    SPI_AVAILABLE = True
+except Exception:
+    spidev = None
+    SPI_AVAILABLE = False
+
+try:
+    from gpiozero import Button, DigitalOutputDevice  # type: ignore
+    GPIOZERO_AVAILABLE = True
+except Exception:
+    Button = None
+    DigitalOutputDevice = None
+    GPIOZERO_AVAILABLE = False
+
+try:
+    from luma.core.interface.serial import i2c  # type: ignore
+    from luma.oled.device import ssd1309  # type: ignore
+    from luma.core.render import canvas  # type: ignore
+    OLED_AVAILABLE = True
+except Exception:
+    i2c = None
+    ssd1309 = None
+    canvas = None
+    OLED_AVAILABLE = False
+
+try:
+    from mpu6050 import mpu6050  # type: ignore
+    MPU_AVAILABLE = True
+except Exception:
+    mpu6050 = None
+    MPU_AVAILABLE = False
+
+try:
+    import RPi.GPIO as GPIO  # type: ignore
+    GPIO_AVAILABLE = True
+except Exception:
+    GPIO = None
+    GPIO_AVAILABLE = False
+
+ROWS = [22, 23, 27, 17]
+COLS = [6, 5, 25, 24]
+KEYS = [
+    ["1", "2", "3", "A"],
+    ["4", "5", "6", "B"],
+    ["7", "8", "9", "C"],
+    ["*", "0", "#", "D"],
+]
+
+FLOW_PIN = 4
+FLOW_PULSES_PER_LITER = 450.0
+ENC1_A = 16
+ENC1_B = 20
+ENC2_A = 21
+ENC2_B = 26
+
+DRY_VAL = 4095
+WET_VAL = 1000
+
+BIAS_X = 1.63
+BIAS_Y = -0.283
+BIAS_Z = -0.65
+SCALE_X = -1.0116
+SCALE_Y = -0.9954
+SCALE_Z = 0.9835
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+DEMO_STATE_NAMES = {
+    0: "IDLE",
+    1: "OPEN",
+    2: "PUMP",
+    3: "VALVE",
+    4: "DRIVE",
+}
+
+
+@dataclass
+class NanoState:
+    connected: bool = False
+    port: str = ""
+    status_text: str = "Disconnected"
+    last_line: str = ""
+    last_seen: float = 0.0
+
+    millis: str = ""
+    m1_cmd: int = 0
+    m2_cmd: int = 0
+    enabled: int = 0
+    angle_deg: Optional[float] = None
+    lim1: int = 0
+    lim2: int = 0
+
+    psi: Optional[float] = None
+    pump: int = 0
+    pctrl: int = 0
+    valve_pct: Optional[float] = None
+
+    drive_enabled: bool = False
+    direction: int = 1
+    speed: int = 120
+    target_angle: Optional[float] = None
+    error_deg: Optional[float] = None
+    travel_cmd: int = 0
+    align_cmd: int = 0
+    mode: str = "IDLE"
+    demo_active: bool = False
+    demo_state: str = "IDLE"
+    demo_next_direction: int = 1
+    motion_mode: str = "SPEED"
+    motion_phase: str = "MOVE"
+
+    history: deque = field(default_factory=lambda: deque(maxlen=8))
+    demo_complete_count: int = 0
+    last_demo_complete: str = ""
+
+
+@dataclass
+class AppState:
+    page: int = 1
+    motor_speed: int = 120
+    travel_direction: int = 1
+    target_angle: Optional[float] = None
+    drive_enabled: bool = False
+
+    flow_pulses: int = 0
+    flow_lpm: float = 0.0
+    flow_total_liters: float = 0.0
+    flow_last_calc_time: float = field(default_factory=time.time)
+    flow_last_calc_pulses: int = 0
+
+    enc1_count: int = 0
+    enc2_count: int = 0
+
+    soil_raw: Optional[int] = None
+    soil_pct: Optional[int] = None
+
+    accel_xyz: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    tilt_x: float = 0.0
+    tilt_y: float = 0.0
+    vib_mag: float = 0.0
+    vib_std: float = 0.0
+
+    demo_armed: bool = False
+    demo_threshold: int = 40
+    demo_latched: bool = False
+    last_demo_event: str = ""
+    motion_mode: str = "SPEED"
+    stop_event: threading.Event = field(default_factory=threading.Event)
+
+
+class SerialManager:
+    def __init__(self, port: Optional[str], baud: int, nano_state: NanoState):
+        self.requested_port = port
+        self.baud = baud
+        self.nano = nano_state
+        self.ser = None
+        self.lock = threading.Lock()
+        self.tx_queue: queue.Queue[str] = queue.Queue()
+        self.rx_thread = None
+        self.tx_thread = None
+
+    def candidate_ports(self) -> list[str]:
+        if self.requested_port:
+            return [self.requested_port]
+        ports: list[str] = []
+        for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
+            ports.extend(sorted(glob.glob(pattern)))
+        return ports
+
+    def connect(self) -> bool:
+        if not SERIAL_AVAILABLE:
+            self.nano.connected = False
+            self.nano.status_text = "pyserial missing"
+            return False
+
+        for port in self.candidate_ports():
+            try:
+                ser = serial.Serial(port, self.baud, timeout=0.05)
+                time.sleep(2.0)
+                self.ser = ser
+                self.nano.connected = True
+                self.nano.port = port
+                self.nano.status_text = f"Connected {port}"
+                self.send("HELP")
+                self.send("STATUS")
+                return True
+            except Exception:
+                continue
+
+        self.nano.connected = False
+        self.nano.status_text = "Nano not found"
+        return False
+
+    def start(self) -> None:
+        self.connect()
+        self.rx_thread = threading.Thread(target=self.reader_loop, daemon=True)
+        self.tx_thread = threading.Thread(target=self.writer_loop, daemon=True)
+        self.rx_thread.start()
+        self.tx_thread.start()
+
+    def send(self, cmd: str) -> None:
+        self.tx_queue.put(cmd.strip())
+
+    def writer_loop(self) -> None:
+        while True:
+            cmd = self.tx_queue.get()
+            if cmd == "__STOP__":
+                return
+            if not self.ser or not getattr(self.ser, "is_open", False):
+                if not self.connect():
+                    continue
+            try:
+                with self.lock:
+                    self.ser.write((cmd + "\n").encode("utf-8"))
+            except Exception as exc:
+                self.nano.connected = False
+                self.nano.status_text = f"Write err: {exc}"
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+
+    def reader_loop(self) -> None:
+        while True:
+            if not self.ser or not getattr(self.ser, "is_open", False):
+                if not self.connect():
+                    time.sleep(1.0)
+                    continue
+            try:
+                raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if not raw:
+                    continue
+                self.parse_line(raw)
+            except Exception as exc:
+                self.nano.connected = False
+                self.nano.status_text = f"Read err: {exc}"
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                time.sleep(1.0)
+
+    def close(self) -> None:
+        try:
+            self.tx_queue.put("__STOP__")
+        except Exception:
+            pass
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+
+    def parse_line(self, line: str) -> None:
+        self.nano.connected = True
+        self.nano.last_seen = time.time()
+        self.nano.last_line = line
+
+        if line.startswith("TEL,"):
+            parts = line.split(",")
+            if len(parts) >= 12:
+                self.nano.millis = parts[1]
+                self.nano.m1_cmd = int(parts[2]) if parts[2].lstrip("-").isdigit() else 0
+                self.nano.m2_cmd = int(parts[3]) if parts[3].lstrip("-").isdigit() else 0
+                self.nano.enabled = 1 if parts[4] == "1" else 0
+                try:
+                    angle = float(parts[5])
+                    self.nano.angle_deg = None if angle < 0 else angle
+                except ValueError:
+                    self.nano.angle_deg = None
+                self.nano.lim1 = 1 if parts[6] == "1" else 0
+                self.nano.lim2 = 1 if parts[7] == "1" else 0
+
+            if len(parts) >= 23:
+                self.nano.drive_enabled = parts[12] == "1"
+                try:
+                    self.nano.direction = int(parts[13])
+                except ValueError:
+                    pass
+                try:
+                    self.nano.speed = int(parts[14])
+                except ValueError:
+                    pass
+                try:
+                    target = float(parts[15])
+                    self.nano.target_angle = None if target < 0 else target
+                except ValueError:
+                    self.nano.target_angle = None
+                try:
+                    self.nano.error_deg = float(parts[16])
+                except ValueError:
+                    self.nano.error_deg = None
+                try:
+                    self.nano.travel_cmd = int(parts[17])
+                except ValueError:
+                    self.nano.travel_cmd = 0
+                try:
+                    self.nano.align_cmd = int(parts[18])
+                except ValueError:
+                    self.nano.align_cmd = 0
+                self.nano.pump = 1 if parts[19] == "1" else 0
+                self.nano.pctrl = 1 if parts[20] == "1" else 0
+                try:
+                    self.nano.valve_pct = float(parts[21])
+                except ValueError:
+                    self.nano.valve_pct = None
+                self.nano.mode = parts[22].strip() or self.nano.mode
+
+            if len(parts) >= 26:
+                self.nano.demo_active = parts[23] == "1"
+                try:
+                    self.nano.demo_state = DEMO_STATE_NAMES.get(int(parts[24]), self.nano.demo_state)
+                except ValueError:
+                    pass
+                try:
+                    self.nano.demo_next_direction = int(parts[25])
+                except ValueError:
+                    pass
+
+            if len(parts) >= 28:
+                self.nano.motion_mode = parts[26].strip() or self.nano.motion_mode
+                self.nano.motion_phase = parts[27].strip() or self.nano.motion_phase
+
+            self.nano.status_text = f"TEL {self.nano.port}"
+            return
+
+        if line.startswith("ANGLE:"):
+            for pair in line.split(","):
+                if ":" not in pair:
+                    continue
+                key, value = pair.split(":", 1)
+                key = key.strip().upper()
+                value = value.strip()
+                try:
+                    if key == "ANGLE":
+                        self.nano.angle_deg = None if value == "N/A" else float(value)
+                    elif key == "PSI":
+                        self.nano.psi = None if value == "N/A" else float(value)
+                    elif key == "LIM1":
+                        self.nano.lim1 = 1 if value == "1" else 0
+                    elif key == "LIM2":
+                        self.nano.lim2 = 1 if value == "1" else 0
+                    elif key == "PUMP":
+                        self.nano.pump = 1 if value == "1" else 0
+                    elif key == "PCTRL":
+                        self.nano.pctrl = 1 if value == "1" else 0
+                    elif key == "VALVE":
+                        self.nano.valve_pct = float(value)
+                    elif key == "DRIVE":
+                        self.nano.drive_enabled = value == "1"
+                    elif key == "DIR":
+                        self.nano.direction = 1 if value == "FWD" else -1
+                    elif key == "SPEED":
+                        self.nano.speed = int(value)
+                    elif key == "TARGET":
+                        self.nano.target_angle = None if value == "N/A" else float(value)
+                    elif key == "ERR":
+                        self.nano.error_deg = None if value == "N/A" else float(value)
+                    elif key == "TRAVEL":
+                        self.nano.travel_cmd = int(value)
+                    elif key == "ALIGN":
+                        self.nano.align_cmd = int(value)
+                    elif key == "MODE":
+                        self.nano.mode = value
+                    elif key == "MOTION":
+                        self.nano.motion_mode = value
+                    elif key == "MPHASE":
+                        self.nano.motion_phase = value
+                    elif key == "DEMO":
+                        self.nano.demo_state = value
+                        self.nano.demo_active = value != "IDLE"
+                    elif key == "DEMONEXT":
+                        self.nano.demo_next_direction = 1 if value == "FWD" else -1
+                except ValueError:
+                    pass
+            self.nano.status_text = f"STATUS {self.nano.port}"
+            return
+
+        if line.startswith("STATUS,") or line.startswith("ACK,") or line.startswith("ERR,"):
+            self.nano.history.appendleft(line)
+            if line.startswith("STATUS,DEMO_COMPLETE"):
+                self.nano.demo_complete_count += 1
+                self.nano.last_demo_complete = line
+                parts = line.split(",")
+                if len(parts) >= 4:
+                    last_dir = parts[3].strip().upper()
+                    if last_dir == "FWD":
+                        self.nano.demo_next_direction = 1
+                    elif last_dir == "REV":
+                        self.nano.demo_next_direction = -1
+                self.nano.demo_active = False
+                self.nano.demo_state = "IDLE"
+            self.nano.status_text = line[:28]
+            return
+
+        self.nano.history.appendleft(line)
+
+
+class Hardware:
+    def __init__(self) -> None:
+        self.device = None
+        self.rows = []
+        self.cols = []
+        self.spi = None
+        self.mpu = None
+        self.app_state: Optional[AppState] = None
+        self.last_oled_retry = 0.0
+        self.oled_ok = False
+
+    def attach_state(self, app_state: AppState) -> None:
+        self.app_state = app_state
+
+    def setup_oled(self) -> None:
+        if not OLED_AVAILABLE:
+            self.device = None
+            self.oled_ok = False
+            return
+        try:
+            oled_serial = i2c(port=1, address=0x3C)
+            self.device = ssd1309(oled_serial, width=128, height=64)
+            self.oled_ok = True
+        except Exception:
+            self.device = None
+            self.oled_ok = False
+
+    def maybe_recover_oled(self, force: bool = False) -> None:
+        now = time.time()
+        if force or (self.device is None) or (not self.oled_ok and (now - self.last_oled_retry) >= 1.0):
+            self.last_oled_retry = now
+            self.setup_oled()
+
+    def setup_keypad(self) -> None:
+        if not GPIOZERO_AVAILABLE:
+            return
+        try:
+            self.rows = [DigitalOutputDevice(pin, initial_value=True) for pin in ROWS]
+            self.cols = [Button(pin, pull_up=True) for pin in COLS]
+        except Exception:
+            self.rows = []
+            self.cols = []
+
+    def setup_spi(self) -> None:
+        if not SPI_AVAILABLE:
+            return
+        try:
+            self.spi = spidev.SpiDev()
+            self.spi.open(0, 0)
+            self.spi.max_speed_hz = 1350000
+            self.spi.mode = 0
+        except Exception:
+            self.spi = None
+
+    def setup_mpu(self) -> None:
+        if not MPU_AVAILABLE:
+            return
+        try:
+            self.mpu = mpu6050(0x68)
+            self.mpu.set_accel_range(mpu6050.ACCEL_RANGE_2G)
+        except Exception:
+            self.mpu = None
+
+    def setup_gpio_callbacks(self) -> None:
+        if not GPIO_AVAILABLE or self.app_state is None:
+            return
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(FLOW_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC1_A, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC1_B, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC2_A, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC2_B, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.add_event_detect(FLOW_PIN, GPIO.FALLING, callback=self.flow_callback, bouncetime=1)
+            GPIO.add_event_detect(ENC1_A, GPIO.BOTH, callback=self.enc1_callback)
+            GPIO.add_event_detect(ENC2_A, GPIO.BOTH, callback=self.enc2_callback)
+        except Exception:
+            pass
+
+    def flow_callback(self, _channel: int) -> None:
+        if self.app_state:
+            self.app_state.flow_pulses += 1
+
+    def enc1_callback(self, _channel: int) -> None:
+        if not self.app_state or not GPIO_AVAILABLE:
+            return
+        a = GPIO.input(ENC1_A)
+        b = GPIO.input(ENC1_B)
+        self.app_state.enc1_count += 1 if a == b else -1
+
+    def enc2_callback(self, _channel: int) -> None:
+        if not self.app_state or not GPIO_AVAILABLE:
+            return
+        a = GPIO.input(ENC2_A)
+        b = GPIO.input(ENC2_B)
+        self.app_state.enc2_count += 1 if a == b else -1
+
+    def get_key(self) -> Optional[str]:
+        if not self.rows or not self.cols:
+            return None
+        for i, row in enumerate(self.rows):
+            row.off()
+            for j, col in enumerate(self.cols):
+                if col.is_pressed:
+                    row.on()
+                    return KEYS[i][j]
+            row.on()
+        return None
+
+    def read_soil_raw(self) -> Optional[int]:
+        if not self.spi:
+            return None
+        try:
+            result = self.spi.xfer2([0x00, 0x00])
+            raw = ((result[0] << 8) | result[1]) & 0x1FFF
+            return raw >> 1
+        except Exception:
+            return None
+
+    def get_accel(self) -> Optional[tuple[float, float, float]]:
+        if not self.mpu:
+            return None
+        try:
+            data = self.mpu.get_accel_data()
+            x = (data["x"] - BIAS_X) * SCALE_X
+            y = (data["y"] - BIAS_Y) * SCALE_Y
+            z = (data["z"] - BIAS_Z) * SCALE_Z
+            return x, y, z
+        except Exception:
+            return None
+
+    def draw(self, draw_fn) -> None:
+        if canvas is None:
+            return
+        if self.device is None:
+            self.maybe_recover_oled()
+            if self.device is None:
+                return
+        try:
+            with canvas(self.device) as draw_obj:
+                draw_fn(draw_obj)
+            self.oled_ok = True
+        except Exception:
+            self.device = None
+            self.oled_ok = False
+
+    def close(self) -> None:
+        try:
+            if self.spi:
+                self.spi.close()
+        except Exception:
+            pass
+        try:
+            if GPIO_AVAILABLE:
+                GPIO.cleanup()
+        except Exception:
+            pass
+
+
+def get_soil_pct(raw: Optional[int]) -> Optional[int]:
+    if raw is None:
+        return None
+    pct = (DRY_VAL - raw) / (DRY_VAL - WET_VAL) * 100
+    return int(round(clamp(pct, 0, 100)))
+
+
+def update_flow_metrics(app: AppState) -> None:
+    now = time.time()
+    dt = now - app.flow_last_calc_time
+    if dt <= 0:
+        return
+    current = app.flow_pulses
+    delta = current - app.flow_last_calc_pulses
+    if delta < 0:
+        delta = 0
+    liters_per_second = (delta / FLOW_PULSES_PER_LITER) / dt
+    app.flow_lpm = liters_per_second * 60.0
+    app.flow_total_liters = current / FLOW_PULSES_PER_LITER
+    app.flow_last_calc_time = now
+    app.flow_last_calc_pulses = current
+
+
+def update_motion_metrics(app: AppState, hw: Hardware) -> None:
+    accel = hw.get_accel()
+    if accel is None:
+        return
+    app.accel_xyz = accel
+    x, y, z = accel
+    app.tilt_x = math.degrees(math.atan2(x, math.sqrt(y ** 2 + z ** 2)))
+    app.tilt_y = math.degrees(math.atan2(y, math.sqrt(x ** 2 + z ** 2)))
+
+    readings = []
+    for _ in range(10):
+        sample = hw.get_accel()
+        if sample is None:
+            break
+        sx, sy, sz = sample
+        readings.append(math.sqrt(sx ** 2 + sy ** 2 + sz ** 2))
+        time.sleep(0.005)
+    if readings:
+        avg = sum(readings) / len(readings)
+        variance = sum((r - avg) ** 2 for r in readings) / len(readings)
+        app.vib_mag = avg
+        app.vib_std = math.sqrt(variance)
+
+
+def sync_app_from_nano(app: AppState, nano: NanoState) -> None:
+    app.motor_speed = nano.speed
+    if nano.direction in (-1, 1):
+        app.travel_direction = nano.direction
+    if nano.target_angle is not None:
+        app.target_angle = nano.target_angle
+    app.drive_enabled = nano.drive_enabled
+    app.motion_mode = nano.motion_mode
+
+
+def handle_keypress(key: str, app: AppState, nano: NanoState, serial_mgr: SerialManager) -> None:
+    if key in [str(n) for n in range(1, 9)]:
+        app.page = int(key)
+        return
+
+    if key == "D":
+        serial_mgr.send("ALL_STOP")
+        app.drive_enabled = False
+        return
+
+    if app.page == 6:
+        if key == "A":
+            serial_mgr.send("PUMP_ON")
+        elif key == "B":
+            serial_mgr.send("PUMP_OFF")
+        elif key == "C":
+            serial_mgr.send("STATUS")
+        elif key == "*":
+            serial_mgr.send("OPEN_STEP")
+        elif key == "#":
+            serial_mgr.send("CLOSE_STEP")
+        elif key == "0":
+            serial_mgr.send("FORCE_OPEN")
+        elif key == "5":
+            serial_mgr.send("VALVE_STOP")
+        return
+
+    if app.page == 7:
+        if key == "A":
+            serial_mgr.send("CAPTURE_TARGET")
+            if nano.angle_deg is not None:
+                app.target_angle = nano.angle_deg
+        elif key == "B":
+            serial_mgr.send("DIR,TOGGLE")
+            app.travel_direction *= -1
+        elif key == "#":
+            app.motor_speed = min(255, app.motor_speed + 10)
+            serial_mgr.send(f"SPEED,{app.motor_speed}")
+        elif key == "*":
+            app.motor_speed = max(0, app.motor_speed - 10)
+            serial_mgr.send(f"SPEED,{app.motor_speed}")
+        elif key == "C":
+            serial_mgr.send("DRIVE_ON")
+            app.drive_enabled = True
+        elif key == "0":
+            serial_mgr.send("DRIVE_OFF")
+            app.drive_enabled = False
+        return
+
+    if app.page == 8:
+        if key == "A":
+            app.demo_armed = not app.demo_armed
+            app.demo_latched = False
+            if not app.demo_armed:
+                serial_mgr.send("DEMO_ABORT")
+        elif key == "B":
+            serial_mgr.send("DEMO_START")
+            app.demo_latched = True
+        elif key == "C":
+            serial_mgr.send("MOTION,TOGGLE")
+            app.motion_mode = "TRADITIONAL" if app.motion_mode == "SPEED" else "SPEED"
+        elif key == "*":
+            app.demo_threshold = max(0, app.demo_threshold - 10)
+            app.demo_latched = False
+        elif key == "#":
+            app.demo_threshold = min(100, app.demo_threshold + 10)
+            app.demo_latched = False
+        elif key == "0":
+            serial_mgr.send("DEMO_ABORT")
+            app.demo_latched = False
+
+
+def console_help() -> str:
+    return (
+        "Commands: help, status, pump on, pump off, open, close, force_open, valve_stop, "
+        "open_ms <ms>, close_ms <ms>, drive on, drive off, dir fwd|rev|toggle, motion speed|traditional|toggle, speed <0-255>, "
+        "target capture, target <deg>, demo arm|disarm|start|abort, demo thresh <0-100>, demo dir fwd|rev|toggle, allstop, page <1-8>, quit"
+    )
+
+
+def console_loop(app: AppState, nano: NanoState, serial_mgr: SerialManager) -> None:
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    print(console_help())
+    while not app.stop_event.is_set():
+        try:
+            line = input("prod> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            app.stop_event.set()
+            return
+        if not line:
+            continue
+        parts = line.split()
+        cmd = parts[0].lower()
+        try:
+            if cmd == "help":
+                print(console_help())
+            elif cmd == "status":
+                serial_mgr.send("STATUS")
+            elif cmd == "pump" and len(parts) >= 2 and parts[1].lower() == "on":
+                serial_mgr.send("PUMP_ON")
+            elif cmd == "pump" and len(parts) >= 2 and parts[1].lower() == "off":
+                serial_mgr.send("PUMP_OFF")
+            elif cmd == "open":
+                serial_mgr.send("OPEN_STEP")
+            elif cmd == "close":
+                serial_mgr.send("CLOSE_STEP")
+            elif cmd == "force_open":
+                serial_mgr.send("FORCE_OPEN")
+            elif cmd == "valve_stop":
+                serial_mgr.send("VALVE_STOP")
+            elif cmd == "open_ms" and len(parts) >= 2:
+                serial_mgr.send(f"OPEN_MS,{int(parts[1])}")
+            elif cmd == "close_ms" and len(parts) >= 2:
+                serial_mgr.send(f"CLOSE_MS,{int(parts[1])}")
+            elif cmd == "drive" and len(parts) >= 2 and parts[1].lower() == "on":
+                serial_mgr.send("DRIVE_ON")
+                app.drive_enabled = True
+            elif cmd == "drive" and len(parts) >= 2 and parts[1].lower() == "off":
+                serial_mgr.send("DRIVE_OFF")
+                app.drive_enabled = False
+            elif cmd == "dir" and len(parts) >= 2 and parts[1].lower() in {"fwd", "forward"}:
+                serial_mgr.send("DIR,FWD")
+                app.travel_direction = 1
+            elif cmd == "dir" and len(parts) >= 2 and parts[1].lower() in {"rev", "reverse"}:
+                serial_mgr.send("DIR,REV")
+                app.travel_direction = -1
+            elif cmd == "dir" and len(parts) >= 2 and parts[1].lower() == "toggle":
+                serial_mgr.send("DIR,TOGGLE")
+                app.travel_direction *= -1
+            elif cmd == "motion" and len(parts) >= 2 and parts[1].lower() in {"speed", "normal"}:
+                app.motion_mode = "SPEED"
+                serial_mgr.send("MOTION,SPEED")
+            elif cmd == "motion" and len(parts) >= 2 and parts[1].lower() in {"traditional", "trad", "crawl"}:
+                app.motion_mode = "TRADITIONAL"
+                serial_mgr.send("MOTION,TRADITIONAL")
+            elif cmd == "motion" and len(parts) >= 2 and parts[1].lower() == "toggle":
+                app.motion_mode = "TRADITIONAL" if app.motion_mode == "SPEED" else "SPEED"
+                serial_mgr.send("MOTION,TOGGLE")
+            elif cmd == "speed" and len(parts) >= 2:
+                app.motor_speed = int(clamp(int(parts[1]), 0, 255))
+                serial_mgr.send(f"SPEED,{app.motor_speed}")
+            elif cmd == "target" and len(parts) >= 2 and parts[1].lower() == "capture":
+                serial_mgr.send("CAPTURE_TARGET")
+                if nano.angle_deg is not None:
+                    app.target_angle = nano.angle_deg
+            elif cmd == "target" and len(parts) >= 2:
+                app.target_angle = float(parts[1]) % 360.0
+                serial_mgr.send(f"TARGET,{app.target_angle:.2f}")
+            elif cmd == "demo" and len(parts) >= 2 and parts[1].lower() == "arm":
+                app.demo_armed = True
+                app.demo_latched = False
+            elif cmd == "demo" and len(parts) >= 2 and parts[1].lower() == "disarm":
+                app.demo_armed = False
+                app.demo_latched = False
+                serial_mgr.send("DEMO_ABORT")
+            elif cmd == "demo" and len(parts) >= 2 and parts[1].lower() == "start":
+                serial_mgr.send("DEMO_START")
+                app.demo_latched = True
+            elif cmd == "demo" and len(parts) >= 2 and parts[1].lower() == "abort":
+                serial_mgr.send("DEMO_ABORT")
+                app.demo_latched = False
+            elif cmd == "demo" and len(parts) >= 3 and parts[1].lower() == "thresh":
+                app.demo_threshold = int(clamp(int(parts[2]), 0, 100))
+                app.demo_latched = False
+            elif cmd == "demo" and len(parts) >= 3 and parts[1].lower() == "dir" and parts[2].lower() in {"fwd", "forward"}:
+                serial_mgr.send("DEMO_DIR,FWD")
+            elif cmd == "demo" and len(parts) >= 3 and parts[1].lower() == "dir" and parts[2].lower() in {"rev", "reverse"}:
+                serial_mgr.send("DEMO_DIR,REV")
+            elif cmd == "demo" and len(parts) >= 3 and parts[1].lower() == "dir" and parts[2].lower() == "toggle":
+                serial_mgr.send("DEMO_DIR,TOGGLE")
+            elif cmd == "allstop":
+                serial_mgr.send("ALL_STOP")
+                app.drive_enabled = False
+            elif cmd == "page" and len(parts) >= 2:
+                app.page = int(clamp(int(parts[1]), 1, 8))
+            elif cmd in {"quit", "exit"}:
+                app.stop_event.set()
+                return
+            else:
+                print("Unrecognized command")
+        except Exception as exc:
+            print(f"Command error: {exc}")
+
+
+class CsvLogger:
+    def __init__(self, path: Path):
+        self.file = path.open("w", newline="")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow([
+            "timestamp", "page", "soil_raw", "soil_pct", "flow_lpm", "flow_total_liters",
+            "enc1_count", "enc2_count", "vib_mag", "vib_std", "tilt_x", "tilt_y",
+            "nano_connected", "nano_port", "nano_angle_deg", "nano_lim1", "nano_lim2",
+            "nano_pump", "nano_valve_pct", "nano_mode", "nano_drive_enabled", "nano_direction",
+            "nano_speed", "nano_target_angle", "nano_error_deg", "nano_travel_cmd", "nano_align_cmd",
+            "nano_demo_active", "nano_demo_state", "nano_demo_next_dir", "nano_motion_mode", "nano_motion_phase",
+            "app_demo_armed", "app_demo_threshold", "app_motion_mode", "nano_m1_cmd", "nano_m2_cmd", "nano_status"
+        ])
+
+    def log(self, app: AppState, nano: NanoState) -> None:
+        self.writer.writerow([
+            datetime.now().isoformat(timespec="seconds"), app.page, app.soil_raw, app.soil_pct,
+            round(app.flow_lpm, 3), round(app.flow_total_liters, 3), app.enc1_count, app.enc2_count,
+            round(app.vib_mag, 4), round(app.vib_std, 4), round(app.tilt_x, 3), round(app.tilt_y, 3),
+            int(nano.connected), nano.port, nano.angle_deg, nano.lim1, nano.lim2, nano.pump,
+            nano.valve_pct, nano.mode, int(nano.drive_enabled), nano.direction, nano.speed,
+            nano.target_angle, nano.error_deg, nano.travel_cmd, nano.align_cmd,
+            int(nano.demo_active), nano.demo_state, nano.demo_next_direction, nano.motion_mode, nano.motion_phase,
+            int(app.demo_armed), app.demo_threshold, app.motion_mode, nano.m1_cmd, nano.m2_cmd, nano.status_text,
+        ])
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+def draw_bar(draw, x: int, y: int, width: int, height: int, pct: float) -> None:
+    draw.rectangle([x, y, x + width, y + height], outline="white")
+    filled = int((clamp(pct, 0, 100) / 100.0) * (width - 2))
+    if filled > 0:
+        draw.rectangle([x + 1, y + 1, x + 1 + filled, y + height - 1], fill="white")
+
+
+def draw_page(draw, app: AppState, nano: NanoState) -> None:
+    def header(title: str) -> None:
+        draw.text((0, 0), title, fill="white")
+        draw.line([(0, 11), (127, 11)], fill="white")
+
+    if app.page == 1:
+        header("OVERVIEW [1]")
+        draw.text((0, 14), f"Soil:{app.soil_pct if app.soil_pct is not None else '--'}%", fill="white")
+        draw.text((64, 14), f"Ang:{'--' if nano.angle_deg is None else f'{nano.angle_deg:.1f}'}", fill="white")
+        draw.text((0, 26), f"Flow:{app.flow_lpm:4.1f}L/m", fill="white")
+        draw.text((64, 26), f"Tot:{app.flow_total_liters:4.1f}L", fill="white")
+        draw.text((0, 38), f"Drv:{1 if nano.drive_enabled else 0} P:{nano.pump}", fill="white")
+        draw.text((64, 38), f"L:{nano.lim1}/{nano.lim2}", fill="white")
+        draw.text((0, 50), nano.status_text[:20], fill="white")
+        draw.text((102, 50), "D=STOP", fill="white")
+
+    elif app.page == 2:
+        header("SOIL [2]")
+        pct = app.soil_pct if app.soil_pct is not None else 0
+        draw.text((0, 15), f"Pct:{app.soil_pct if app.soil_pct is not None else '--'}%", fill="white")
+        draw_bar(draw, 0, 30, 128, 14, pct)
+        draw.text((0, 50), f"Raw:{app.soil_raw if app.soil_raw is not None else '--'}", fill="white")
+
+    elif app.page == 3:
+        header("FLOW [3]")
+        draw.text((0, 15), f"Rate:{app.flow_lpm:5.2f}L/m", fill="white")
+        draw.text((0, 27), f"Total:{app.flow_total_liters:6.2f}L", fill="white")
+        draw.text((0, 39), f"Pulses:{app.flow_pulses}", fill="white")
+        draw.text((0, 51), "8:B zero flow", fill="white")
+
+    elif app.page == 4:
+        header("VIBRATION [4]")
+        draw.text((0, 15), f"Mag:{app.vib_mag:.2f}", fill="white")
+        draw.text((0, 27), f"Std:{app.vib_std:.3f}", fill="white")
+        draw.text((0, 39), f"TiltX:{app.tilt_x:.1f}", fill="white")
+        draw.text((0, 51), f"TiltY:{app.tilt_y:.1f}", fill="white")
+
+    elif app.page == 5:
+        header("NANO [5]")
+        draw.text((0, 14), f"Port:{nano.port or '--'}", fill="white")
+        draw.text((0, 26), f"Mode:{nano.mode[:8]}", fill="white")
+        draw.text((64, 26), f"Valve:{'--' if nano.valve_pct is None else f'{nano.valve_pct:.0f}%'}", fill="white")
+        draw.text((0, 38), f"M1:{nano.m1_cmd} M2:{nano.m2_cmd}", fill="white")
+        draw.text((0, 50), (nano.history[0] if nano.history else nano.status_text)[:21], fill="white")
+
+    elif app.page == 6:
+        header("WATER CTRL [6]")
+        draw.text((0, 14), f"Pump:{nano.pump} Valve:{'--' if nano.valve_pct is None else f'{nano.valve_pct:.0f}%'}", fill="white")
+        draw.text((0, 26), "A on B off C stat", fill="white")
+        draw.text((0, 38), "*=open #=close", fill="white")
+        draw.text((0, 50), "260ms / 10% steps", fill="white")
+
+    elif app.page == 7:
+        header("DRIVE CTRL [7]")
+        direction = "FWD" if app.travel_direction > 0 else "REV"
+        state = "RUN" if nano.drive_enabled else "STOP"
+        angle = "--" if nano.angle_deg is None else f"{nano.angle_deg:.1f}"
+        target = "--" if app.target_angle is None else f"{app.target_angle:.1f}"
+        err = "--" if nano.error_deg is None else f"{nano.error_deg:+.1f}"
+        mode = "SPD" if app.motion_mode == "SPEED" else "TRAD"
+        phase = nano.motion_phase[:5]
+        draw.text((0, 14), f"{state} {direction} {mode}", fill="white")
+        draw.text((0, 26), f"S:{app.motor_speed} Ang:{angle}", fill="white")
+        draw.text((0, 38), f"T:{target} E:{err} {phase}", fill="white")
+        draw.text((0, 50), "C run 0 stop", fill="white")
+
+    else:
+        header("DEMO [8]")
+        armed = "ARM" if app.demo_armed else "OFF"
+        soil = "--" if app.soil_pct is None else f"{app.soil_pct}%"
+        nxt = "FWD" if nano.demo_next_direction > 0 else "REV"
+        mode = "SPD" if app.motion_mode == "SPEED" else "TRAD"
+        draw.text((0, 14), f"{armed} Thr:{app.demo_threshold}% {mode}", fill="white")
+        draw.text((0, 26), f"Soil:{soil} {nano.demo_state[:5]}", fill="white")
+        draw.text((0, 38), f"B run 0 abort {nxt}", fill="white")
+        draw.text((0, 50), "A arm C mode * #", fill="white")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Nano-owned irrigation production console")
+    parser.add_argument("--port", default=os.environ.get("NANO_PORT"), help="Serial port, e.g. /dev/ttyUSB0")
+    parser.add_argument("--baud", type=int, default=115200, help="Nano serial baud")
+    parser.add_argument("--log-dir", default=".", help="Directory for CSV log")
+    parser.add_argument("--no-console", action="store_true", help="Disable terminal command loop")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    app = AppState()
+    nano = NanoState()
+    hw = Hardware()
+    hw.attach_state(app)
+    hw.setup_oled()
+    hw.setup_keypad()
+    hw.setup_spi()
+    hw.setup_mpu()
+    hw.setup_gpio_callbacks()
+
+    serial_mgr = SerialManager(args.port, args.baud, nano)
+    serial_mgr.start()
+
+    log_path = Path(args.log_dir) / f"irrigation_production_nano_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    logger = CsvLogger(log_path)
+
+    console_thread = None
+    if not args.no_console:
+        console_thread = threading.Thread(target=console_loop, args=(app, nano, serial_mgr), daemon=True)
+        console_thread.start()
+
+    print(f"Logging to {log_path}")
+    print("Keypad pages: 1 Overview, 2 Soil, 3 Flow, 4 Vibration, 5 Nano, 6 Water, 7 Drive, 8 Demo")
+    print("Global: D = ALL STOP")
+
+    last_key = None
+    last_soil = 0.0
+    last_motion = 0.0
+    last_status = 0.0
+    last_log = 0.0
+    last_draw = 0.0
+
+    try:
+        while not app.stop_event.is_set():
+            now = time.time()
+
+            update_flow_metrics(app)
+            sync_app_from_nano(app, nano)
+
+            if now - last_soil >= 1.0:
+                app.soil_raw = hw.read_soil_raw()
+                app.soil_pct = get_soil_pct(app.soil_raw)
+                last_soil = now
+
+            if nano.last_demo_complete and nano.last_demo_complete != app.last_demo_event:
+                app.demo_latched = False
+                app.last_demo_event = nano.last_demo_complete
+
+            # Do not require both limits to clear before restarting demo.
+            # In your system, the hit limit can remain closed until the tower
+            # reverses and pulls away. The Nano now applies directional limits,
+            # so it can safely restart in the opposite direction while the last
+            # hit switch is still physically held.
+            if app.demo_armed and (not app.demo_latched) and app.soil_pct is not None and app.soil_pct <= app.demo_threshold and nano.demo_state == "IDLE":
+                serial_mgr.send("DEMO_START")
+                app.demo_latched = True
+
+            if nano.demo_state != "IDLE":
+                app.demo_latched = True
+
+            if now - last_motion >= 0.5:
+                update_motion_metrics(app, hw)
+                last_motion = now
+
+            if now - last_status >= 1.0:
+                serial_mgr.send("STATUS")
+                last_status = now
+
+            key = hw.get_key()
+            if key and key != last_key:
+                handle_keypress(key, app, nano, serial_mgr)
+                last_key = key
+            elif not key:
+                last_key = None
+
+            if now - last_draw >= 0.15:
+                hw.draw(lambda draw_obj: draw_page(draw_obj, app, nano))
+                last_draw = now
+
+            if now - last_log >= 1.0:
+                logger.log(app, nano)
+                last_log = now
+
+            time.sleep(0.08)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.stop_event.set()
+        try:
+            serial_mgr.send("ALL_STOP")
+            time.sleep(0.2)
+        except Exception:
+            pass
+        logger.close()
+        serial_mgr.close()
+        hw.close()
+        print("Stopped")
+
+
+if __name__ == "__main__":
+    main()
